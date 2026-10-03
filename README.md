@@ -14,7 +14,37 @@
 ## 公开仓库约定
 
 仓库是公开的。提交前跑 `python3 check_public.py`：它拒绝绝对的本机路径、本地配置、产物目录和私钥类内容。
+检查失败时只报告文件、行号和问题类别，不回显命中内容。
 内部笔记、实测记录、素材清单写到素材目录（如 Hakko `00_文档/_归档/creative-pipeline/`），不要提交进来。
+
+## CI 与本地检查
+
+[GitHub Actions CI](.github/workflows/ci.yml) 在 push、pull request 和手动触发时运行。
+使用 Ubuntu 24.04、Python 3.11，只做公开内容检查、Python 语法编译和标准库测试。
+不安装媒体工具、不编译 whisper.cpp、不下载模型，也不需要 `config.local.json` 或 API key。
+
+缺少媒体工具或模型时，4 个媒体端到端测试自动跳过，这是基础 CI 的预期行为。
+Seedance 只跑 4 个文本解析测试，不生成视频、不调用 API；它们是普通函数，
+`unittest` 不会执行，需用 `python3 test_seedance_gen.py` 单独运行。
+
+本地复现快速检查：
+
+```bash
+python3 check_public.py
+git ls-files -z '*.py' | xargs -0 python3 -m py_compile
+python3 -m unittest discover -v
+python3 test_seedance_gen.py
+```
+
+修改转码、OCR、转写或交付流程时，可在本地补跑媒体端到端测试。
+先安装 ffmpeg、tesseract 和 whisper-cli，并按「本机配置」设置 `WHISPER_MODEL` 等路径：
+
+```bash
+python3 -c 'import config; config.validate_strict()' && \
+  python3 -m unittest -v test_batch_pipeline.EndToEndTests test_preflight.EndToEndTests
+```
+
+基础 CI 通过不代表媒体端到端或线上服务已经验收。
 
 ## 目录结构
 

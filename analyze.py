@@ -8,24 +8,27 @@ analyze.py <素材目录> [--out out/<批次名>] [--force]
   keyframes/<视频名>.jpg   0.3s/2s/5s/中点/尾帧 contact sheet
   transcript.csv           whisper-cli 转写（file, start, end, text）
   transcript_brand_hits.csv
-  ocr_frames.csv           每 N 秒抽帧过 tesseract（file, ts, text）
+  ocr_frames.csv           每 N 秒抽帧识别画面文字（file, ts, text；macOS 用 Apple Vision，其他平台 tesseract）
   ocr_brand_hits.csv
 
 支持断点续跑：某个文件在对应 csv 里已经有记录就跳过，--force 强制重跑全部。
 
-OCR 抽帧间隔默认 2s（可在 config.py 的 OCR_INTERVAL_SEC 调回 1s，2s 是为了在真实素材上
-跑得动，见 README 验收记录里的取舍说明）。转写只用 base 模型（本机没有 base.en，见
-config.py 里的探测记录）。
+OCR 抽帧间隔见 config.py 的 OCR_INTERVAL_SEC（1s）。转写只用 base 模型（本机没有 base.en，见
+config.py 里的探测记录），段落时间用 DTW 词级时间戳校正。
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import hashlib
 import json
+import os
+import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import config
@@ -33,7 +36,7 @@ import scanner
 
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 
-OCR_INTERVAL_SEC = getattr(config, "OCR_INTERVAL_SEC", 2.0)
+OCR_INTERVAL_SEC = config.OCR_INTERVAL_SEC
 
 
 # ---------------------------------------------------------------------------
@@ -269,13 +272,29 @@ def extract_audio_wav(video: Path, wav_path: Path) -> bool:
     return cp.returncode == 0 and wav_path.exists()
 
 
+DTW_PRESETS = {"tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en",
+               "large.v1", "large.v2", "large.v3", "large.v3.turbo"}
+DTW_LEAD = 0.2  # DTW 词时间比实际开口晚 0.1–0.2 秒（2026-10 实测 32 段，中位 +0.11），段首前移留余量
+DTW_TAIL = 0.3  # DTW 只给每个词的起点，段尾至少留出最后一个词的发音
+
+
+def dtw_preset(model_path: str) -> str | None:
+    """模型文件名对应的 whisper-cli -dtw 预设：ggml-base.bin → base，ggml-large-v3-turbo-q5_0.bin → large.v3.turbo。"""
+    match = re.fullmatch(r"ggml-(.+?)(?:-q\d\w*)?\.bin", Path(model_path).name)
+    preset = match.group(1).replace("-", ".") if match else None
+    return preset if preset in DTW_PRESETS else None
+
+
 def _whisper_json(wav_path: Path, language: str) -> dict | None:
     out_prefix = wav_path.with_suffix("")
+    preset = dtw_preset(config.WHISPER_MODEL)
     cp = run([
         config.WHISPER_CLI,
         "-m", config.WHISPER_MODEL,
         "-l", language,
-        "-oj", "-of", str(out_prefix),
+        "-ojf", "-of", str(out_prefix),
+        # 词级 DTW 时间戳（需要 whisper-cpp ≥ 1.8，且必须关 flash attention，否则 t_dtw 全是 -1）。
+        *(["-dtw", preset, "-nfa"] if preset else []),
         # 注意：不能加 -nt。-nt 会让 whisper-cli 的 json 输出退化成一整段
         # 假 offsets（固定 0~30000ms），不是真实分段时间戳；segments 级时间戳
         # 必须去掉 -nt 才能拿到（实测验证，见 README 验收记录）。
@@ -298,11 +317,16 @@ def _whisper_segments(data: dict) -> list[dict]:
     segments = []
     for t in data.get("transcription", []):
         offsets = t.get("offsets", {})
-        segments.append({
-            "start": offsets.get("from", 0) / 1000.0,
-            "end": offsets.get("to", 0) / 1000.0,
-            "text": t.get("text", "").strip(),
-        })
+        start, end = offsets.get("from", 0) / 1000.0, offsets.get("to", 0) / 1000.0
+        word_times = [tok["t_dtw"] / 100.0 for tok in t.get("tokens", [])
+                      if tok.get("t_dtw", -1) >= 0 and not tok.get("text", "").startswith("[_")
+                      and any(c.isalnum() for c in tok.get("text", ""))]
+        if word_times:
+            # whisper 的段落起点常卡在上一段结尾或整秒，比实际开口早 0.3–3 秒，段尾也会切掉最后一个词；
+            # 按切点剪辑会剪错，有 DTW 词时间就用它校正。
+            start = max(0.0, word_times[0] - DTW_LEAD)
+            end = max(end, word_times[-1] + DTW_TAIL)
+        segments.append({"start": start, "end": end, "text": t.get("text", "").strip()})
     return segments
 
 
@@ -318,6 +342,98 @@ def whisper_transcribe_detect(wav_path: Path) -> tuple[list[dict], str | None]:
     if not data:
         return [], None
     return _whisper_segments(data), (data.get("result") or {}).get("language")
+
+
+# ---------------------------------------------------------------------------
+# 画面文字识别：macOS 用 Apple Vision，其他平台回退 tesseract
+# ---------------------------------------------------------------------------
+# 2026-10 在 Cuddler/Hakko 真实成片上对比：烧录字幕（白字描边）tesseract 几乎全漏，Vision 基本全对；
+# 风格化 logo 和日文也只有 Vision 认得出，而且每帧更快（约 70ms 对 150–350ms）。
+
+VISION_OCR_SRC = Path(__file__).with_name("vision_ocr.swift")
+MIN_TEXT_CONF = 40  # 低于这个置信度的识别结果当噪声（Vision 只给 30/50/100 三档，tesseract 0–100）
+
+
+@functools.cache
+def _vision_ocr_bin() -> Path | None:
+    """macOS 上按源码哈希把 vision_ocr.swift 编译进缓存目录（只编一次）；不是 macOS 或编译不了时返回 None。"""
+    if not config.SWIFTC:
+        return None
+    digest = hashlib.sha256(VISION_OCR_SRC.read_bytes()).hexdigest()[:12]
+    binary = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "creative-pipeline" / f"vision_ocr-{digest}"
+    if not binary.exists():
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        building = binary.with_name(f"{binary.name}.{os.getpid()}")
+        cp = run([config.SWIFTC, "-O", str(VISION_OCR_SRC), "-o", str(building)])
+        if cp.returncode != 0:
+            building.unlink(missing_ok=True)
+            print(f"    vision_ocr 编译失败，回退 tesseract: {cp.stderr[-300:]}", file=sys.stderr)
+            return None
+        building.replace(binary)
+    return binary
+
+
+def tsv_lines(tsv: str) -> list[dict]:
+    """tesseract TSV 的词按行合并成和 Vision 同样的文字行；低置信度的词当噪声丢掉。"""
+    lines: dict[tuple, list[dict]] = {}
+    for row in tsv.splitlines()[1:]:
+        cols = row.split("\t")
+        if len(cols) < 12 or cols[0] != "5" or not cols[11].strip():
+            continue
+        try:
+            conf = float(cols[10])
+        except ValueError:
+            continue
+        if conf >= MIN_TEXT_CONF:
+            left, top, width, height = map(int, cols[6:10])
+            lines.setdefault((cols[2], cols[3], cols[4]), []).append(
+                {"text": cols[11].strip(), "conf": conf, "left": left, "top": top,
+                 "right": left + width, "bottom": top + height})
+    result = []
+    for words in lines.values():
+        left, top = min(w["left"] for w in words), min(w["top"] for w in words)
+        result.append({"text": " ".join(w["text"] for w in words),
+                       "conf": sum(w["conf"] for w in words) / len(words),
+                       "left": left, "top": top,
+                       "width": max(w["right"] for w in words) - left,
+                       "height": max(w["bottom"] for w in words) - top})
+    return result
+
+
+def ocr_images(images: list[Path], language: str = "en") -> list[list[dict]]:
+    """逐张识别画面文字，每张图返回文字行 [{text, conf(0–100), left, top, width, height}]（像素，原点左上）。
+
+    language 是语言代码（en/ja/es…）。Vision 只按这一个语言识别，日文素材必须传 ja；
+    tesseract 回退只认英文。"""
+    vision = _vision_ocr_bin()
+    if vision is None:
+        if not os.path.isfile(config.TESSERACT or ""):
+            raise RuntimeError("没有可用的画面文字识别：macOS 需要 swiftc（Xcode Command Line Tools），其他平台需要 tesseract")
+        return [tsv_lines(run([config.TESSERACT, str(image), "stdout", "tsv"]).stdout) for image in images]
+    if not images:
+        return []
+    cp = run([str(vision), "--lang", language, *map(str, images)])
+    rows = [json.loads(line) for line in cp.stdout.splitlines() if line.strip()] if cp.returncode == 0 else []
+    if len(rows) != len(images):
+        raise RuntimeError(f"vision_ocr 失败（returncode={cp.returncode}）: {cp.stderr[-300:]}")
+    return [row["lines"] for row in rows]
+
+
+def ocr_video(video: Path, scratch: Path, interval_sec: float, language: str = "en") -> list[tuple[float, list[dict]]]:
+    """每 interval_sec 秒抽一帧识别画面文字，返回 [(ts, 文字行), ...]。
+
+    抽帧失败抛 RuntimeError：扫不动的文件不能当成“画面没有文字”放过。"""
+    with tempfile.TemporaryDirectory(prefix=".ocr-", dir=scratch) as tmp:
+        cp = run([config.FFMPEG, "-v", "error", "-y", "-i", str(video), "-vf", f"fps=1/{interval_sec}",
+                  str(Path(tmp) / "%05d.png")])
+        if cp.returncode != 0:
+            raise RuntimeError(f"抽帧失败: {cp.stderr[-500:]}")
+        frames = sorted(Path(tmp).glob("*.png"))
+        return [(index * interval_sec, lines) for index, lines in enumerate(ocr_images(frames, language))]
+
+
+def frame_text(lines: list[dict]) -> str:
+    return " ".join(line["text"] for line in lines if line["conf"] >= MIN_TEXT_CONF)
 
 
 def build_transcript(videos: list[Path], out_dir: Path, force: bool) -> tuple[int, int]:
@@ -418,30 +534,17 @@ def build_ocr(videos: list[Path], out_dir: Path, force: bool) -> int:
         if v.name in done:
             continue
         try:
-            probe = ffprobe_json(v)
-            duration = get_duration_sec(probe)
-        except Exception as e:
-            print(f"  [ocr] ffprobe 失败: {v.name}: {e}", file=sys.stderr)
+            frames = ocr_video(v, scratch, OCR_INTERVAL_SEC)
+        except RuntimeError as e:
+            print(f"  [ocr] {v.name}: {e}", file=sys.stderr)
             continue
 
-        ts = 0.0
-        while ts < duration:
-            frame_path = scratch / f".{v.stem}_{ts:.2f}.jpg"
-            cp = run([
-                config.FFMPEG, "-y", "-ss", f"{ts:.3f}", "-i", str(v),
-                "-frames:v", "1", "-q:v", "3", str(frame_path),
-            ])
-            text = ""
-            if cp.returncode == 0 and frame_path.exists():
-                ocr_cp = run([config.TESSERACT, str(frame_path), "stdout"])
-                if ocr_cp.returncode == 0:
-                    text = " ".join(ocr_cp.stdout.split())
-                frame_path.unlink(missing_ok=True)
+        for ts, lines in frames:
+            text = frame_text(lines)
             rows.append({"file": v.name, "ts": f"{ts:.2f}", "text": text})
             for hit in scanner.find_brand_hits(text):
                 hit_rows.append({"file": v.name, "ts": f"{ts:.2f}", "brand": hit.brand, "matched_text": hit.matched_text})
                 hit_files.add(v.name)
-            ts += OCR_INTERVAL_SEC
 
     with open(ocr_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["file", "ts", "text"])

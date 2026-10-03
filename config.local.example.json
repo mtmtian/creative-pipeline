@@ -2,5 +2,6 @@
   "HAKKO_ROOT": "/path/to/Hakko/文案&脚本&视频制作-Hakko",
   "LUDDI_ROOT": "/path/to/Luddi/文案&脚本&视频制作",
   "WHISPER_MODEL": "/path/to/ggml-base.bin",
-  "HAKKO_SECRET_BIN": "/path/to/hakko-secret"
+  "HAKKO_SECRET_BIN": "/path/to/hakko-secret",
+  "CUDDLER_ROOT": "/path/to/Cuddler/素材"
 }

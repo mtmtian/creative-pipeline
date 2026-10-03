@@ -2,11 +2,13 @@
 工具路径、本机配置、品牌词表与产品 profile。
 
 - 工具（ffmpeg/ffprobe/whisper-cli/tesseract）按 env -> PATH -> Homebrew 默认路径解析；容器/CI 用
-  FFMPEG_BIN/FFPROBE_BIN/TESSERACT_BIN/WHISPER_BIN 覆盖。
+  FFMPEG_BIN/FFPROBE_BIN/TESSERACT_BIN/WHISPER_BIN 覆盖。画面文字识别在 macOS 上用系统自带的
+  Apple Vision（vision_ocr.swift，首次使用自动编译），tesseract 只在其他平台用。
 - 因机器而异的路径（素材根目录、whisper 模型、hakko-secret）不进仓库：按环境变量 -> 仓库根目录
   config.local.json（已 gitignore，模板见 config.local.example.json）读取。
 - 运行前用 `python3 config.py` 或 validate_strict() 检查；缺工具或模型直接报错，不静默降级。
 - whisper 用多语言 ggml-base 模型；本机没有 English-only base.en 模型，英文素材也走多语言模型。
+  段落时间用 DTW 词级时间戳校正（需要 whisper-cpp ≥ 1.8）。
 """
 
 from __future__ import annotations
@@ -73,6 +75,8 @@ FFMPEG = _resolve_ffmpeg_full_first("FFMPEG_BIN", "ffmpeg", "/opt/homebrew/opt/f
 FFPROBE = _resolve_ffmpeg_full_first("FFPROBE_BIN", "ffprobe", "/opt/homebrew/opt/ffmpeg-full/bin/ffprobe")
 WHISPER_CLI = _resolve_bin("WHISPER_BIN", "whisper-cli", "/opt/homebrew/bin/whisper-cli")
 TESSERACT = _resolve_bin("TESSERACT_BIN", "tesseract", "/opt/homebrew/bin/tesseract")
+# macOS 用系统自带的 Apple Vision 识别画面文字，vision_ocr.swift 要用 swiftc 编译；其他平台为 None，回退 tesseract。
+SWIFTC = shutil.which("swiftc") if sys.platform == "darwin" else None
 
 # whisper 模型：多语言 ggml-base.bin，路径因机器而异（WHISPER_MODEL）。
 WHISPER_MODEL = local_setting("WHISPER_MODEL") or None
@@ -105,11 +109,10 @@ BRANDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# OCR 抽帧间隔（秒）。规格默认 1s，真实素材批跑非常慢（tesseract 每帧几百 ms + ffmpeg
-# 抽帧开销），本轮验收为了在可接受时间内跑完 5 个真实文件，放宽到 2s。
-# 需要更高召回率时改回 1.0 即可，不用改扫描逻辑。
+# analyze.py / qc.py 的 OCR 抽帧间隔（秒），和 preflight 一致。早先 tesseract 每帧几百 ms，
+# 为了跑得动放宽到 2s；改用 Apple Vision 后每帧约 70ms，回到 1s。
 # ---------------------------------------------------------------------------
-OCR_INTERVAL_SEC = 2.0
+OCR_INTERVAL_SEC = 1.0
 
 
 def _check_problems() -> list[str]:
@@ -130,7 +133,7 @@ def _check_problems() -> list[str]:
             f"whisper-cli 未找到（期望路径: {WHISPER_CLI}）。请运行: brew install whisper-cpp"
             "（或设置环境变量 WHISPER_BIN 指向真实路径）。"
         )
-    if not os.path.isfile(TESSERACT):
+    if not SWIFTC and not os.path.isfile(TESSERACT):
         problems.append(
             f"tesseract 未找到（期望路径: {TESSERACT}）。请运行: brew install tesseract"
             "（或设置环境变量 TESSERACT_BIN 指向真实路径）。"
@@ -192,12 +195,23 @@ PRODUCT = {
 # 素材根目录（本机配置）；未配置时 profile 里的路径退化为相对路径，只能跑不依赖素材的单测。
 HAKKO_ROOT = local_setting("HAKKO_ROOT")
 LUDDI_ROOT = local_setting("LUDDI_ROOT")
+CUDDLER_ROOT = local_setting("CUDDLER_ROOT")
 
 # 带 code / batch_root 的 profile 可以建生产批次（batch_pipeline.py）；code 是成片素材 ID 的产品前缀。
 # 各产品素材区统一为 00_文档/01_资产/02_源素材/03_人力产出/04_agent产出（2026-10-04 重整），
 # agent 批次只放 04_agent产出/生产批次/，人力与代理交付在 03_人力产出/。
 PRODUCT_PROFILES = {
-    "cuddler": PRODUCT,
+    # PRODUCT 会整段写进 LLM 提示词，批次字段只放在这份合并后的 profile 里。
+    "cuddler": {
+        **PRODUCT,
+        "code": "cuddler",
+        "batch_root": os.path.join(CUDDLER_ROOT, "04_agent产出/生产批次"),
+        "endcard_tokens": ["cuddler", "download", "app store", "google play"],
+        "competitor_brands": BRANDS,
+        "default_formats": ["9:16"],
+        "audio_strategies": ["source", "seedance", "voiceover", "silent"],
+        "default_audio_strategy": "source",
+    },
     "hakko-pc": {
         "name": "HakkoAI PC",
         "code": "hakkopc",

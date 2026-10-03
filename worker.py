@@ -637,8 +637,8 @@ def qc_scan(video_path: Path, scratch: Path) -> dict:
     返回 {"pass": bool, "hits": [{"t", "source", "brand", "text"}, ...]}。
 
     品牌匹配逻辑完全复用 scanner.py（含 config.BRANDS 里的 ASR 误识别变体）；
-    OCR 抽帧扫描复用 qc.py 的 scan_frames_for_brand_hits（单次 ffmpeg 抽帧 + 逐帧
-    tesseract，不再各自维护一份逐时间戳 -ss 抽帧循环），只是把结构化 hits 整理成 API
+    OCR 抽帧扫描复用 qc.py 的 scan_frames_for_brand_hits（底层是 analyze.ocr_video：单次
+    ffmpeg 抽帧 + Apple Vision / tesseract 识别），只是把结构化 hits 整理成 API
     契约要求的形状，而不是 qc.py 那种拼接成一行 detail 字符串的 CSV 行——两边输出
     契约不同，无法直接调用 qc.py 的 qc_audio/qc_ocr，但底层的转写/抽帧/OCR/匹配函数
     （analyze.py + qc.py + scanner.py）原样复用，没有重新实现。"""
@@ -1111,7 +1111,7 @@ def main() -> None:
     if not secret:
         sys.exit("缺少 secret：需要 --secret 或环境变量 WORKER_WEBHOOK_SECRET，二者都未提供。")
     # worker.py 无论 dry-run 还是 --confirm 都要用 ffmpeg（占位生成/裁剪/拼装）+
-    # tesseract/whisper（QC 品牌预检），实际要用之前显式严格校验（import config 本身
+    # OCR/whisper（QC 品牌预检），实际要用之前显式严格校验（import config 本身
     # 不再退出）。
     config.validate_strict()
     run_worker(args, secret)

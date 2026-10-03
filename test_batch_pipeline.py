@@ -80,7 +80,9 @@ class BatchCase(unittest.TestCase):
 class ProfileTests(unittest.TestCase):
     def test_batch_profiles_cover_pc_mobile_luddi_and_cuddler_stays_default(self) -> None:
         self.assertIs(config.get_product_profile(), config.PRODUCT)
-        self.assertEqual(config.batch_profiles(), ["hakko-pc", "hakko-mobile", "luddi"])
+        self.assertEqual(config.batch_profiles(), ["cuddler", "hakko-pc", "hakko-mobile", "luddi"])
+        self.assertNotIn("code", config.PRODUCT)  # LLM prompts embed PRODUCT; batch fields stay out of it
+        self.assertEqual(config.get_product_profile("cuddler")["code"], "cuddler")
         pc, mobile = config.get_product_profile("hakko-pc"), config.get_product_profile("hakko-mobile")
         luddi = config.get_product_profile("luddi")
         self.assertEqual((pc["code"], mobile["code"], luddi["code"]), ("hakkopc", "hakkomobile", "luddi"))
@@ -123,7 +125,7 @@ class CreativeIdTests(unittest.TestCase):
             with self.subTest(case=case), self.assertRaises(ValueError):
                 pipeline.creative_id(**{**base, **case})
         with self.assertRaises(ValueError):
-            pipeline.creative_id("cuddler", PC_BATCH, "US", "16:9", "anytime", 1)
+            pipeline.creative_id("not-a-product", PC_BATCH, "US", "16:9", "anytime", 1)
 
     def test_legacy_delivery_names_are_not_creative_ids(self) -> None:
         for legacy in ("hakko_new_jared_ai_girlfriend_16x9", "hakko_20260727_dota_ai_coach_1x1",
@@ -148,7 +150,7 @@ class BatchInitializationTests(BatchCase):
 
     def test_rejects_profiles_without_batch_support(self) -> None:
         with self.assertRaisesRegex(ValueError, "不能建生产批次"):
-            pipeline.initialize_batch(self.root / PC_BATCH, "cuddler")
+            pipeline.initialize_batch(self.root / PC_BATCH, "not-a-product")
 
     def test_reinitializing_preserves_metadata_and_profile(self) -> None:
         batch = self.make_batch()
@@ -464,8 +466,10 @@ class AnalyzeAndRenderCommandTests(BatchCase):
                     Path("in.mp4"), Path("sub.srt"), Path("out.mp4"), format_name, "source", None)
                 vf = command[command.index("-vf") + 1]
                 self.assertIn(f"scale={canvas}", vf)
-                self.assertTrue(vf.split(",")[-1].startswith("subtitles="), vf)
+                self.assertRegex(vf, r",subtitles=filename='[^']*'(:force_style='[^']*')?$")  # 字幕是最后一个 filter
                 self.assertIn("[0:a:0]apad[aout]", command)
+                # 只有竖版把字幕抬离底部的平台浮层区
+                self.assertEqual("Alignment=6,MarginV=194" in vf, format_name == "9:16")
         with self.assertRaisesRegex(ValueError, "voiceover"):
             pipeline.build_burn_srt_command(Path("i"), Path("s"), Path("o"), "1:1", "voiceover", None)
 
@@ -507,10 +511,11 @@ class CliTests(BatchCase):
 
 
 MEDIA_TOOLS = all(Path(p or "").is_file() for p in (config.FFMPEG, config.FFPROBE, config.WHISPER_CLI,
-                                                      config.TESSERACT, config.WHISPER_MODEL))
+                                                      config.WHISPER_MODEL)) and (
+    bool(config.SWIFTC) or Path(config.TESSERACT or "").is_file())
 
 
-@unittest.skipUnless(MEDIA_TOOLS, "needs ffmpeg, whisper-cli + model and tesseract (preflight runs in the flow)")
+@unittest.skipUnless(MEDIA_TOOLS, "needs ffmpeg, whisper-cli + model and an OCR engine (preflight runs in the flow)")
 class EndToEndTests(BatchCase):
     """Real ffmpeg/ffprobe through the CLI: produce, review, QC, approve, deliver."""
 

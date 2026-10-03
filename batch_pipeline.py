@@ -442,11 +442,15 @@ def build_burn_srt_command(input_video: Path, srt_path: Path, output_video: Path
         raise ValueError("voiceover 音频策略必须提供 --audio")
 
     width, height, _ = FORMAT_SPECS[format_name]
+    # 竖版字幕从画面 67% 处往下排（SRT 在 libass 里以 288 为满高，顶端对齐 MarginV=194），避开 TikTok 底部的
+    # 账号名和文案浮层；横版补黑边成竖版时，画面底边在 66%，字幕正好落在下方黑边顶部，多行也不压画面。
+    # force_style 的 Alignment 按旧版 SSA 编号：6 是顶部居中（不是 ASS 的 8）。
+    style = ":force_style='Alignment=6,MarginV=194'" if format_name == "9:16" else ""
     # subtitles 必须是最后一个视频 filter；后续不得再接画面处理。
     video_filter = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"setsar=1,fps=30,subtitles=filename='{_escape_subtitles_path(srt_path)}'"
+        f"setsar=1,fps=30,subtitles=filename='{_escape_subtitles_path(srt_path)}'{style}"
     )
     command = [config.FFMPEG, "-y", "-i", str(input_video)]
     if audio_strategy == "voiceover":

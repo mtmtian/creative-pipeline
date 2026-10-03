@@ -150,47 +150,48 @@ class SpeechTests(unittest.TestCase):
                                   "speech_language"), ["PASS"])
 
 
-def word(text, left, top=900, width=120, height=60, conf=95.0, line=("1", "1", "1")) -> dict:
-    return {"text": text, "conf": conf, "left": left, "top": top, "width": width, "height": height, "line": line}
+def line(text, left, width=600, top=900, height=60, conf=100.0) -> dict:
+    return {"text": text, "conf": conf, "left": left, "top": top, "width": width, "height": height}
 
 
 class ScreenTextTests(unittest.TestCase):
     W, H, D = 1080, 1920, 20.0
 
-    def frame(self, ts, words):
-        return {"ts": ts, "words": words}
+    def frame(self, ts, lines):
+        return ts, lines
 
     def test_caption_line_cut_at_the_edge_warns(self) -> None:
-        cut = [word("the", 10), word("idea", 140), word("behind", 270)]
-        frames = [self.frame(1, cut), self.frame(2, cut), self.frame(19, [word("Hakko", 400, top=900)])]
+        cut = [line("the idea behind", 10)]
+        frames = [self.frame(1, cut), self.frame(2, cut), self.frame(19, [line("Hakko", 400, width=200)])]
         results = preflight.judge_ocr(frames, self.W, self.H, self.D, ["hakko"], [])
         self.assertEqual(statuses(results, "text_edge"), ["WARN"])
         self.assertEqual(statuses(results, "endcard"), ["PASS"])
 
     def test_single_labels_or_small_hud_text_at_the_edge_are_ignored(self) -> None:
-        label = [word("RGR29", 15, height=80)]
-        hud = [word("mahdi", 1000, height=20, line=("2", "1", "1")), word("spotted", 1030, height=20,
-                                                                          line=("2", "1", "1")),
-               word("enemy", 1060, height=20, line=("2", "1", "1"))]
-        frames = [self.frame(t, label + hud) for t in range(5)]
+        label = line("RGR29", 15, width=150, height=80)
+        hud = line("mahdi spotted enemy", 900, width=180, height=20)
+        corner = line("League of Legends", 20, width=231)  # 字幕大小的角落标签，但不跨中线
+        frames = [self.frame(t, [label, hud, corner]) for t in range(5)]
         self.assertEqual(statuses(preflight.judge_ocr(frames, self.W, self.H, self.D, [], []), "text_edge"), ["PASS"])
 
+    def test_japanese_caption_without_spaces_counts_as_a_caption_line(self) -> None:
+        cut = [line("誰もが自分の物語の主人公", 20, width=900)]
+        frames = [self.frame(1, cut), self.frame(2, cut)]
+        self.assertEqual(statuses(preflight.judge_ocr(frames, self.W, self.H, self.D, [], []), "text_edge"), ["WARN"])
+
     def test_competitor_name_on_screen_fails_and_missing_endcard_warns(self) -> None:
-        frames = [self.frame(3, [word("Try", 300), word("PolyBuzz", 450), word("today", 700)])]
+        frames = [self.frame(3, [line("Try PolyBuzz today", 300)])]
         results = preflight.judge_ocr(frames, self.W, self.H, self.D, ["hakko", "download"], config.BRANDS)
         self.assertEqual(statuses(results, "screen_brand"), ["FAIL"])
         self.assertEqual(statuses(results, "endcard"), ["WARN"])
         pc = preflight.judge_ocr(frames, self.W, self.H, self.D, [], [])
         self.assertEqual(statuses(pc, "screen_brand"), ["PASS"])
 
-    def test_parse_tsv_keeps_word_boxes_and_line_ids(self) -> None:
-        tsv = ("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
-               "4\t1\t2\t1\t1\t0\t21\t1631\t1050\t140\t-1\t\n"
-               "5\t1\t2\t1\t1\t1\t21\t1631\t220\t122\t96.4\tneed\n"
-               "5\t1\t2\t1\t1\t2\t300\t1640\t90\t100\t-1\t \n")
-        words = preflight.parse_tsv(tsv)
-        self.assertEqual(len(words), 1)
-        self.assertEqual((words[0]["text"], words[0]["left"], words[0]["line"]), ("need", 21, ("2", "1", "1")))
+    def test_multi_word_endcard_tokens_are_recognised(self) -> None:
+        frames = [self.frame(18, [line("Download on the", 200), line("App Store", 250, conf=50.0)]),
+                  self.frame(19, [line("Google Play", 250, conf=30.0)])]
+        results = preflight.judge_ocr(frames, self.W, self.H, self.D, ["app store", "google play"], [])
+        self.assertEqual(results[-1]["detail"], "结尾识别到 app store")  # conf 30 的行当噪声
 
 
 class MetadataTests(unittest.TestCase):
@@ -212,11 +213,11 @@ class MetadataTests(unittest.TestCase):
         self.assertTrue(all(0 <= t <= 2.95 for t in preflight.sheet_times(3.0)))
 
 
-TOOLS = all(Path(p or "").is_file() for p in (config.FFMPEG, config.FFPROBE, config.WHISPER_CLI, config.TESSERACT,
-                                                config.WHISPER_MODEL))
+TOOLS = all(Path(p or "").is_file() for p in (config.FFMPEG, config.FFPROBE, config.WHISPER_CLI, config.WHISPER_MODEL))
+OCR_READY = bool(config.SWIFTC) or Path(config.TESSERACT or "").is_file()
 
 
-@unittest.skipUnless(TOOLS, "needs ffmpeg, whisper-cli + model and tesseract")
+@unittest.skipUnless(TOOLS and OCR_READY, "needs ffmpeg, whisper-cli + model and Apple Vision or tesseract")
 class EndToEndTests(unittest.TestCase):
     """Synthetic clips with one planted defect each; the defect must be the verdict."""
 

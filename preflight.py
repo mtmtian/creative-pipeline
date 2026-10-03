@@ -24,13 +24,15 @@ import re
 import shutil
 import sys
 import tempfile
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
 import config
 import scanner
-from analyze import VIDEO_EXTS, extract_audio_wav, ffprobe_json, run, whisper_transcribe_detect
+from analyze import (VIDEO_EXTS, extract_audio_wav, ffprobe_json, frame_text, ocr_video, run,
+                     whisper_transcribe_detect)
 from batch_pipeline import FORMAT_SPECS, LOCALE_RE, parse_creative_id
 
 REPO_DIR = Path(__file__).resolve().parent
@@ -297,41 +299,20 @@ def transcribe(path: Path, scratch: Path) -> tuple[list[dict], str | None]:
 
 # --------------------------------------------------------------------------- on-screen text
 
-def parse_tsv(tsv: str) -> list[dict]:
-    words = []
-    for line in tsv.splitlines()[1:]:
-        cols = line.split("\t")
-        if len(cols) < 12 or cols[0] != "5" or not cols[11].strip():
-            continue
-        try:
-            conf = float(cols[10])
-        except ValueError:
-            continue
-        words.append({"text": cols[11].strip(), "conf": conf, "left": int(cols[6]), "top": int(cols[7]),
-                      "width": int(cols[8]), "height": int(cols[9]), "line": (cols[2], cols[3], cols[4])})
-    return words
+def caption_words(text: str) -> int:
+    """一行字的词数；日文、中文这类不用空格分词的宽字符按约 3 个字一个词折算。"""
+    words = sum(1 for w in text.split() if any(c.isalnum() for c in w))
+    wide = sum(1 for c in text if unicodedata.east_asian_width(c) in "WF")
+    return max(words, wide // 3)
 
 
-def ocr_frames(path: Path, scratch: Path) -> list[dict]:
-    completed = run([config.FFMPEG, "-v", "error", "-y", "-i", str(path), "-vf", f"fps=1/{OCR_INTERVAL}",
-                     str(scratch / "ocr_%05d.png")])
-    if completed.returncode != 0:
-        raise RuntimeError(f"抽帧失败: {completed.stderr[-300:]}")
-    frames = []
-    for index, image in enumerate(sorted(scratch.glob("ocr_*.png"))):
-        tsv = run([config.TESSERACT, str(image), "stdout", "tsv"])
-        frames.append({"ts": index * OCR_INTERVAL, "words": parse_tsv(tsv.stdout) if tsv.returncode == 0 else []})
-        image.unlink(missing_ok=True)
-    return frames
-
-
-def judge_ocr(frames: list[dict], width: int, height: int, duration: float,
+def judge_ocr(frames: list[tuple[float, list[dict]]], width: int, height: int, duration: float,
               endcard_tokens: list[str], brands: list[str]) -> list[dict]:
+    """frames 是 analyze.ocr_video 的结果：[(秒数, 文字行), ...]。"""
     results = []
     hits = []
-    for frame in frames:
-        text = " ".join(w["text"] for w in frame["words"] if w["conf"] >= 40)
-        hits += [f"{frame['ts']:.0f}s [{h.brand}] “{h.matched_text}”" for h in scanner.find_brand_hits(text, brands)]
+    for ts, lines in frames:
+        hits += [f"{ts:.0f}s [{h.brand}] “{h.matched_text}”" for h in scanner.find_brand_hits(frame_text(lines), brands)]
     if not brands:
         results.append(result("screen_brand", "PASS", "该产品没有竞品词表，未扫描"))
     elif hits:
@@ -339,22 +320,17 @@ def judge_ocr(frames: list[dict], width: int, height: int, duration: float,
     else:
         results.append(result("screen_brand", "PASS", f"{len(frames)} 帧画面文字无竞品品牌词"))
 
-    # 字幕被裁的样子是"一整行字顶到左右边缘"；单个词贴边多半是游戏 HUD、主播 ID 角标，不算。
+    # 字幕被裁的样子是"一整行字横跨画面中线、顶到左右边缘"；单个词贴边、角落里的游戏 HUD、主播 ID、
+    # 聊天浮窗不跨中线，都不算（Vision 认得出这些小字，2026-10 在 PC 人力批次上校准）。
     edge_frames = []
-    for frame in frames:
-        lines: dict[tuple, list[dict]] = {}
-        for w in frame["words"]:
-            if (w["conf"] >= 60 and any(c.isalnum() for c in w["text"])
-                    and w["height"] >= CAPTION_MIN_HEIGHT * height):
-                lines.setdefault(w.get("line"), []).append(w)
-        for words in lines.values():
-            if len(words) < CAPTION_MIN_WORDS:
-                continue
-            left = min(w["left"] for w in words)
-            right = max(w["left"] + w["width"] for w in words)
-            if left <= EDGE_SHARE * width or right >= (1 - EDGE_SHARE) * width:
-                text = " ".join(w["text"] for w in sorted(words, key=lambda w: w["left"]))
-                edge_frames.append(f"{frame['ts']:.0f}s “{text[:60]}”")
+    for ts, lines in frames:
+        for line in lines:
+            left, right = line["left"], line["left"] + line["width"]
+            if (line["conf"] >= 60 and line["height"] >= CAPTION_MIN_HEIGHT * height
+                    and caption_words(line["text"]) >= CAPTION_MIN_WORDS
+                    and left < width / 2 < right
+                    and (left <= EDGE_SHARE * width or right >= (1 - EDGE_SHARE) * width)):
+                edge_frames.append(f"{ts:.0f}s “{line['text'][:60]}”")
                 break
     if len(edge_frames) >= 2:
         results.append(result("text_edge", "WARN",
@@ -363,9 +339,9 @@ def judge_ocr(frames: list[dict], width: int, height: int, duration: float,
         results.append(result("text_edge", "PASS", "没有贴边被裁的字幕"))
 
     if endcard_tokens:
-        tail = [w["text"].lower() for f in frames if f["ts"] >= duration - ENDCARD_WINDOW
-                for w in f["words"] if w["conf"] >= 40]
-        found = sorted({t for t in endcard_tokens for word in tail if t in word})
+        # 按整行文字匹配，"app store" 这类多词 token 才认得出来
+        tail = " ".join(frame_text(lines) for ts, lines in frames if ts >= duration - ENDCARD_WINDOW).lower()
+        found = sorted(t for t in endcard_tokens if t in tail)
         if found:
             results.append(result("endcard", "PASS", f"结尾识别到 {', '.join(found)}"))
         else:
@@ -435,7 +411,7 @@ def check_video(path: Path, profile: dict, locale: str | None, channel: str | No
         entry["results"] += judge_speech(segments, language, locale, brands)
 
         try:
-            frames = ocr_frames(path, scratch)
+            frames = ocr_video(path, scratch, OCR_INTERVAL, LOCALE_LANGUAGE.get(locale or "", "en"))
             entry["results"] += judge_ocr(frames, info["width"], info["height"], info["duration"],
                                           profile.get("endcard_tokens", []), brands)
         except RuntimeError as e:

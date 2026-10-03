@@ -1,13 +1,13 @@
 # creative-pipeline
 
-广告视频素材的分析、改造、生产批次与投放前可用性预检工具链（本地处理，ffmpeg / whisper.cpp / tesseract）。
+广告视频素材的分析、改造、生产批次与投放前可用性预检工具链（本地处理，ffmpeg / whisper.cpp / Apple Vision，非 macOS 用 tesseract）。
 
 规格来源：[adex](https://github.com/mtmtian/adex) 仓库 `docs/growth/08-competitor-creative-pipeline.md`。
 
 ## 本机配置
 
 素材根目录、whisper 模型和 hakko-secret 的位置因机器而异，不进仓库。复制 `config.local.example.json` 为
-`config.local.json`（已 gitignore）后填写，或用同名环境变量覆盖：`HAKKO_ROOT`、`LUDDI_ROOT`、`WHISPER_MODEL`、
+`config.local.json`（已 gitignore）后填写，或用同名环境变量覆盖：`HAKKO_ROOT`、`LUDDI_ROOT`、`CUDDLER_ROOT`、`WHISPER_MODEL`、
 `HAKKO_SECRET_BIN`。工具路径用 `FFMPEG_BIN` / `FFPROBE_BIN` / `WHISPER_BIN` / `TESSERACT_BIN` 覆盖。
 `python3 config.py` 打印并校验当前配置。
 
@@ -50,6 +50,7 @@ python3 -c 'import config; config.validate_strict()' && \
 
 ```text
 config.py       工具路径（ffmpeg/ffprobe/whisper-cli/tesseract）+ 品牌词表，导入时校验，缺什么直接报错退出
+vision_ocr.swift  macOS 画面文字识别（Apple Vision），analyze.ocr_images 首次使用时自动编译
 scanner.py      品牌词扫描公共模块（analyze.py 和 qc.py 共享，不复制粘贴）
 analyze.py      四件套批处理：manifest / metadata / keyframes / transcript / ocr
 classify.py     规则版分级建议：读 analyze.py 产物 -> classification.csv
@@ -206,18 +207,23 @@ python3 preflight.py <成片或目录...> --profile hakko-pc [--locale US] [--ch
 | silence / loudness | 全片无声 | 开场无声 ≥1.5s；中段无声 ≥3s；响度 < -24 或 > -8 LUFS；真峰值 > +1 dBFS |
 | speech_brand / screen_brand | 口播或画面文字出现该产品 `competitor_brands` 里的竞品词（hakko-mobile 用 `config.BRANDS`；hakko-pc 暂无竞品列表，不扫） | — |
 | speech_language | 口播语种与地区不符（US→en，JP→ja…，少于 5 个词不判） | 地区不在语种表 |
-| text_edge | — | ≥2 帧有“至少 3 个词的字幕行”顶到画面左右 3% 以内（被裁或没留安全边距） |
+| text_edge | — | ≥2 帧有“至少 3 个词、横跨画面中线的字幕行”顶到画面左右 3% 以内（被裁或没留安全边距；角落 HUD、浮窗不算） |
 | endcard | — | 结尾 3 秒 OCR 没认出 profile 的 `endcard_tokens` |
 
 地区优先从素材 ID 文件名或 `<地区>/` 目录识别，其次 `--locale`。产物：`report.json`、`report.html`（每条附开头 3 秒 /
 中段 / 结尾 3 秒抽帧，FAIL 排最前）、`sheets/`。任一 FAIL 退出码 1。转写用 whisper-cli 自动识别语种，画面文字用
-tesseract（只装了英文模型，日文画面文字不识别），全程本地处理。PASS 只代表自动检查没发现问题，hook 吸引力、尺度、
+Apple Vision（按地区选识别语言，日文可识别），全程本地处理。PASS 只代表自动检查没发现问题，hook 吸引力、尺度、
 遮标质量仍需人看审片页。
 
 2026-10-04 在真实素材上的结果（规则校准依据）：PC 人力批次 `9.28` 11 条中 10 条 PASS、1 条 WARN（第 23–24 秒字幕行
 左右顶边）；7 月 agent 批次 `20260727-ai-girlfriend-hooks` 6 条全部 PASS（编码是 HEVC 或 44.1kHz，但不影响投放）；
 今天的横转竖样片 3 条 WARN（跟拍镜头切断烧录字幕、16:9 尾帧缩进竖版后近乎全黑）。单个词贴边（主播 ID 角标、
 游戏 HUD）不报；峰值顶在 0 dBFS 的投放母带只在 PASS 说明里提示。
+
+同日改用 Apple Vision 后复跑：Vision 认得出角落里的游戏标签和聊天浮窗，字幕行因此加了“横跨画面中线”的条件。
+`9.28` 仍是 10 PASS / 1 WARN；7 月 agent 批次 6 条 PASS；移动端代理批次 15 条 0 FAIL、4 WARN（1 条字幕几乎占满全宽没留
+边距，3 条字幕压在 UI 字或水印上被识别成同一行）；日语代理 2 条 1 WARN（游戏顶部标题贴左边，误报）；Cuddler
+TikTok 重剪 6 条里有 1 条新加的 hook 文案顶到右边缘，挪到画面中部后全部 PASS。
 
 ### analyze.py 产物说明
 
@@ -226,9 +232,9 @@ tesseract（只装了英文模型，日文画面文字不识别），全程本�
 | `manifest.csv` | file, rel_path, size_bytes, duration_sec, fingerprint, dup_of |
 | `metadata.csv` | file, duration_sec, width, height, fps, video_codec, has_audio, audio_codec, bitrate_kbps |
 | `keyframes/<视频名>.jpg` | 0.3s/2s/5s/中点/尾帧 横向拼接 contact sheet |
-| `transcript.csv` | file, start, end, text（whisper-cli 转写，逐段） |
+| `transcript.csv` | file, start, end, text（whisper-cli 转写，逐段；段首段尾按 DTW 词级时间戳校正） |
 | `transcript_brand_hits.csv` | file, start, end, brand, matched_text |
-| `ocr_frames.csv` | file, ts, text（每 `OCR_INTERVAL_SEC` 秒抽帧 tesseract OCR） |
+| `ocr_frames.csv` | file, ts, text（每 `OCR_INTERVAL_SEC` 秒抽帧识别画面文字） |
 | `ocr_brand_hits.csv` | file, ts, brand, matched_text |
 
 覆盖了 Luddi 参考产物（`metadata.csv` / `ocr_frames.csv` / `transcript_summary.csv`）的信息量，
@@ -398,13 +404,19 @@ adex control-plane 派活、本仓库执行的 worker 端。向 adex 的 `claim`
 
 ## 已知取舍 / 限制
 
-- **OCR 抽帧间隔**：规格默认 1s，本机对真实素材端到端跑 5 个文件后，1s 间隔耗时明显更长；
-  为了在验收轮次内跑完，`config.py` 的 `OCR_INTERVAL_SEC` 设为 **2.0s**，改回 1.0 不需要动扫描逻辑。
+- **画面文字识别**：macOS 上用系统自带的 Apple Vision（`vision_ocr.swift`，首次使用时用 `swiftc` 编译到
+  `~/.cache/creative-pipeline/`），其他平台回退 tesseract。2026-10 在 Cuddler / Hakko 真实成片上对比：
+  烧录字幕（白字描边）tesseract 几乎全漏、Vision 基本全对；结尾风格化 logo Vision 6/6、tesseract 2/6；
+  日文字幕只有 Vision 认得出；每帧约 70ms，tesseract 150–350ms，所以抽帧间隔统一为 1s。Vision 只按一个语言识别，
+  preflight 按地区传语言（JP→ja），analyze.py / qc.py 默认英文。
 - **whisper 模型**：用多语言 `ggml-base.bin`（`WHISPER_MODEL`）。没有 English-only 的 base.en 模型，
-  英文素材也走多语言模型，转写效果可用。
+  英文素材也走多语言模型，转写效果可用。背景音乐下的轻声口播 base 偶尔漏听，做日文素材时再考虑换
+  `large-v3-turbo`（文件名决定 DTW 预设，换模型不用改代码）。
+- **whisper 时间戳**：段落 `offsets` 常卡在上一段结尾或整秒，比实际开口早 0.3–3 秒，段尾还会切掉最后一个词；
+  按它剪会剪错。现在转写带 `-dtw <预设> -nfa`（DTW 必须关 flash attention），用词级时间戳校正段首段尾，
+  32 段实测与人声能量起点相差中位 0.1 秒。需要 whisper-cpp ≥ 1.8。
 - **whisper-cli 参数**：不能加 `-nt`（no-timestamps）。实测 `-nt` 会让 json 输出的每段
-  `offsets` 退化成固定的 `0~30000ms` 占位值，不是真实分段时间戳；本项目转写时不传 `-nt`，
-  从 json 的 `transcription[].offsets` 里取真实的逐段 start/end。
+  `offsets` 退化成固定的 `0~30000ms` 占位值，不是真实分段时间戳；本项目转写时不传 `-nt`。
 - **L3 判定不做**：见 classify.py 文件头注释，需要人工或未来接入 LLM 视觉判断。
 - **指纹/去重**：用文件前 4MB 的 md5 + 时长拼接做简单指纹，不是真正的 phash（任务约束里
   不允许引入零标准库以外依赖，视觉感知哈希需要额外库，用这个轻量方案代替）。

@@ -43,7 +43,7 @@ def problems_in(path: str) -> list[str]:
     for number, line in enumerate(text.splitlines(), 1):
         for label, pattern in FORBIDDEN_CONTENT:
             if pattern.search(line):
-                found.append(f"{path}:{number}: {label}：{line.strip()[:120]}")
+                found.append(f"{path}:{number}: {label}")
     return found
 
 

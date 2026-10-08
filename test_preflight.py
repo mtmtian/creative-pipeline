@@ -317,7 +317,7 @@ class EndToEndTests(unittest.TestCase):
         fixed.parent.mkdir()
         subprocess.run([config.FFMPEG, "-v", "error", "-y", "-t", "4", "-i", str(self.tmp / "pulldown.mp4"),
                         "-vf", DEJUDDER, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(fixed)], check=True)
-        before = preflight.frame_changes(self.tmp / "pulldown.mp4")[:119]  # the same first 4 seconds
+        before = preflight.frame_changes(self.tmp / "pulldown.mp4")[:4 * 30 - 1]  # the same first 4 seconds
         self.assertEqual(preflight.judge_judder(before, 30.0)[0]["status"], "WARN")
         self.assertEqual(preflight.judge_judder(preflight.frame_changes(fixed), 30.0)[0]["detail"], "动作中没有重复帧")
 

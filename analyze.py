@@ -45,7 +45,8 @@ OCR_INTERVAL_SEC = config.OCR_INTERVAL_SEC
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+    """默认按文本读输出；读原始像素等二进制输出时传 text=False。"""
+    return subprocess.run(cmd, **{"capture_output": True, "text": True, **kw})
 
 
 def ffprobe_json(path: Path) -> dict:

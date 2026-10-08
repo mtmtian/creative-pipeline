@@ -8,7 +8,7 @@
   FAIL  不可投，必须修：读不出视频、超过平台上传上限、短于 5 秒、解码错误、开场黑屏、全片无声、
         音画时长差过大、声轨或画面出现该产品的竞品品牌词、口播语种与地区不符
   WARN  需要人看一眼再决定：画幅不在 16:9/1:1/4:5/9:16、疑似字幕被裁到画面边缘、结尾没认出品牌/CTA、
-        响度异常、长时间冻帧或静音、时长不在渠道推荐区间
+        响度异常、长时间冻帧或静音、时长不在渠道推荐区间、24fps 复制帧补成 30fps 的动作卡顿
   PASS  自动检查没发现问题；hook 吸引力、尺度、遮标质量仍由人在审片页上判断
 
 产物写到 <out>/：report.json、report.html（审片页，每条附开头 3 秒 / 全片 / 结尾 3 秒抽帧）、sheets/。
@@ -20,11 +20,13 @@ import argparse
 import html
 import json
 import math
+import operator
 import re
 import shutil
 import sys
 import tempfile
 import unicodedata
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -50,6 +52,15 @@ EDGE_SHARE = 0.03           # 文字框贴到左右 3% 以内视为贴边
 CAPTION_MIN_HEIGHT = 0.025  # 只看字幕大小的字，过滤游戏 HUD 小字
 CAPTION_MIN_WORDS = 3       # 至少 3 个词的一行才当字幕行
 TRUE_PEAK_WARN = 1.0        # 投放母带常把峰值压在 0 dBFS，平台不拒；超过 +1 dBFS 才算明显削波
+JUDDER_THUMB = (48, 85)     # 逐帧比较用的灰度缩略图，只取上 60%，避开烧录字幕
+JUDDER_TOP = 0.6
+JUDDER_STILL = 0.05         # 与上一帧的平均绝对差（0-255）低于它算重复帧
+JUDDER_MOVING = 0.15        # 重复帧前后两次变化都高于它才算“动作中顿了一下”
+JUDDER_CUT = 20.0           # 变化高于它算换镜头；不同镜头的补帧相位各不相同
+JUDDER_CYCLE = 5            # 24fps 复制帧补成 30fps：每 5 帧重复 1 帧
+JUDDER_PHASE_SHARE = 0.6    # 一个镜头里 ≥60% 的重复帧落在同一相位，
+JUDDER_SHOT_MIN = 3         # 且至少 3 帧（1-2 帧同相位可能是巧合），这个镜头才算踩在补帧节奏上
+JUDDER_MIN_FRAMES = 8       # 全片踩节奏的重复帧累计这么多才报
 STATUS_ORDER = {"PASS": 0, "WARN": 1, "FAIL": 2}
 
 
@@ -211,6 +222,51 @@ def judge_media(scan: dict, duration: float, has_audio: bool) -> list[dict]:
         note = "（峰值顶格，转码后可能有轻微爆音）" if peak is not None and peak > -1.0 else ""
         results.append(result("loudness", "PASS", f"I={lufs:.1f} LUFS，真峰值 {peak:.1f} dBFS{note}"))
     return results
+
+
+def frame_changes(path: Path) -> list[float] | None:
+    """相邻两帧缩略图的平均绝对差（0-255），第 k 个值是第 k 帧到第 k+1 帧的变化；解码失败返回 None。
+
+    按文件里的原始帧逐帧解码、不重采样：原生 24fps 的片子若按 30fps 解码，解码本身就会补出重复帧。"""
+    width, height = JUDDER_THUMB
+    top = int(height * JUDDER_TOP)
+    completed = run([config.FFMPEG, "-v", "error", "-i", str(path), "-map", "0:v:0",
+                     "-vf", f"scale={width}:{height},crop={width}:{top}:0:0,format=gray",
+                     "-fps_mode", "passthrough", "-f", "rawvideo", "-"], text=False)
+    if completed.returncode != 0:
+        return None
+    size = width * top
+    frames = [completed.stdout[i:i + size] for i in range(0, len(completed.stdout) - size + 1, size)]
+    return [sum(map(abs, map(operator.sub, a, b))) / size for a, b in zip(frames, frames[1:])]
+
+
+def judge_judder(changes: list[float] | None, fps: float | None) -> list[dict]:
+    """24fps 复制帧补成 30fps 的样子：动作中前后帧都在动、本帧原地不动，且这些帧落在每 5 帧的同一位置。
+
+    相位按镜头分别看（两段补帧相位不同的镜头拼在一起时各自仍集中在一个相位），帧数跨镜头累计：
+    剪得碎的片子每个镜头只有几帧，但都踩在同一节奏上。2026-10-08 在 Cuddler 生成剧情片上校准。"""
+    if changes is None:
+        return [result("judder", "WARN", "逐帧解码失败，没检查补帧卡顿")]
+    fps = fps or 30.0
+    repeats = [k for k in range(1, len(changes) - 1) if changes[k] < JUDDER_STILL
+               and changes[k - 1] > JUDDER_MOVING and changes[k + 1] > JUDDER_MOVING]
+    cuts = [k for k, change in enumerate(changes) if change > JUDDER_CUT]
+    on_beat, shots = 0, []
+    for start, end in zip([0, *cuts], [*cuts, len(changes)]):
+        shot = [k + 1 for k in repeats if start <= k < end]  # k+1 是重复上一帧的那一帧
+        if not shot:
+            continue
+        phase, hits = Counter(frame % JUDDER_CYCLE for frame in shot).most_common(1)[0]
+        if hits >= JUDDER_SHOT_MIN and hits / len(shot) >= JUDDER_PHASE_SHARE:
+            on_beat += hits
+            shots.append(f"{_span(shot[0] / fps, shot[-1] / fps)} {hits}/{len(shot)} 帧在帧号 mod {JUDDER_CYCLE} = {phase}")
+    if on_beat >= JUDDER_MIN_FRAMES:
+        more = f"；另有 {len(shots) - 3} 个镜头" if len(shots) > 3 else ""
+        return [result("judder", "WARN", f"疑似 24fps 复制帧补成 30fps，动作中每 5 帧顿一下（{on_beat} 帧）："
+                       + "；".join(shots[:3]) + more)]
+    if repeats:
+        return [result("judder", "PASS", f"动作中 {len(repeats)} 帧重复，没有形成每 5 帧一顿的节奏")]
+    return [result("judder", "PASS", "动作中没有重复帧")]
 
 
 def encoding_note(probe: dict) -> str:
@@ -404,6 +460,7 @@ def check_video(path: Path, profile: dict, locale: str | None, channel: str | No
         scan = parse_media_log(run(media_scan_command(path, info["has_audio"])).stderr, info["duration"])
         entry["lufs"], entry["true_peak"] = scan["lufs"], scan["true_peak"]
         entry["results"] += judge_media(scan, info["duration"], info["has_audio"])
+        entry["results"] += judge_judder(frame_changes(path), info["fps"])
 
         segments, language = transcribe(path, scratch) if info["has_audio"] else ([], None)
         entry["language"], entry["transcript"] = language, segments

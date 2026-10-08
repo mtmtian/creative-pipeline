@@ -69,7 +69,7 @@ mock_adex.py    worker.py 的本地离线验收服务器（stdlib http.server，
 batch_pipeline.py  生产批次入口（hakko-pc / hakko-mobile）：初始化、素材 ID、分析、转码、字幕、品牌尾帧、
                 审核清单、规格 QC、可用性预检、人审、交付 manifest
 preflight.py    成片投放前可用性预检（标准是能在广告平台用）：平台硬限制、解码、黑屏/冻帧/静音/响度、音画时长、
-                竞品品牌词（按产品）、口播语种与地区、字幕贴边被裁、品牌尾帧；输出 report.html 审片页
+                24→30fps 补帧卡顿、竞品品牌词（按产品）、口播语种与地区、字幕贴边被裁、品牌尾帧；输出 report.html 审片页
 test_preflight.py  预检判定规则单测 + 合成缺陷视频端到端
 test_batch_pipeline.py  批次契约、素材 ID、审核/QC 哈希绑定、交付 manifest 单测（含真实 ffmpeg 端到端）
 test_seedance_gen.py  seedance_gen.py 分时段解析纯函数单测（不调 API，不发网络请求）
@@ -205,10 +205,35 @@ python3 preflight.py <成片或目录...> --profile hakko-pc [--locale US] [--ch
 | duration / av_sync | 短于 5s；音画时长差 >1.5s | 不在渠道推荐时长（google 10-180s，tiktok 9-60s）；差 >0.5s |
 | decode / black / freeze | 解码错误；开场 3 秒内黑屏 ≥0.5s；黑屏累计 ≥30%；画面静止累计 ≥50% | 其它 ≥1s 黑屏；开场静止 ≥2s；其它静止 ≥3s（结尾静态尾帧不算） |
 | silence / loudness | 全片无声 | 开场无声 ≥1.5s；中段无声 ≥3s；响度 < -24 或 > -8 LUFS；真峰值 > +1 dBFS |
+| judder | — | 24fps 复制帧补成 30fps：动作中重复帧落在每 5 帧的同一位置（单个镜头 ≥3 帧且 ≥60% 同相位，全片累计 ≥8 帧），看起来卡帧 |
 | speech_brand / screen_brand | 口播或画面文字出现该产品 `competitor_brands` 里的竞品词（hakko-mobile 用 `config.BRANDS`；hakko-pc 暂无竞品列表，不扫） | — |
 | speech_language | 口播语种与地区不符（US→en，JP→ja…，少于 5 个词不判） | 地区不在语种表 |
 | text_edge | — | ≥2 帧有“至少 3 个词、横跨画面中线的字幕行”顶到画面左右 3% 以内（被裁或没留安全边距；角落 HUD、浮窗不算） |
 | endcard | — | 结尾 3 秒 OCR 没认出 profile 的 `endcard_tokens` |
+
+`judder` 的判断方法：按文件里的原始帧逐帧解码成 48×85 灰度缩略图，只取上 60%（避开烧录字幕），算相邻两帧的平均
+绝对差（0-255）。本帧几乎不变（< 0.05）而前后都在动（> 0.15）的帧算重复帧；变化 > 20 算换镜头。24fps 复制帧补成
+30fps 时，重复帧在一个镜头里集中在同一个“帧号 mod 5”上；拼接的不同镜头相位可以不同，所以相位按镜头分别看、帧数
+全片累计。报告列出每个镜头的时间段、帧数和相位。不按 30fps 重采样解码，否则原生 24fps 的片子会被解码过程自己补出
+同样的重复帧而误报。只出 WARN，因为是否要修要看出问题的是哪段：
+
+- 生成镜头（人物、剧情）：剪辑前先去抖，丢掉每 5 帧里的重复帧，再用运动补偿插回均匀的 30fps。实测人脸不变形，
+  快动作有轻微拖影，13 秒竖版约 1 分钟；帧混合（`framerate` 滤镜）会有重影，不用：
+
+  ```bash
+  ffmpeg -i in.mp4 -c:a copy -c:v libx264 -crf 12 -pix_fmt yuv420p \
+    -vf "decimate=cycle=5,minterpolate=fps=30:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1" out.mp4
+  ```
+
+- UI 录屏：不要 minterpolate，滑动和切换时界面文字会被插糊。保持原样（复制帧转 30fps），这段的 WARN 可以接受。
+
+`assemble.py`（`fps=30`）和 `batch_pipeline.py normalize`（`-r 30`）把 24fps 素材（例如 Seedance 生成片）转 30fps 时
+用的也是复制帧，产物会出同样的 WARN。
+
+2026-10-08 在 Cuddler 女性向剧情批次上校准：交来的 21 条生成剧情片都是 24fps 复制帧补成 30fps，20 条 WARN（帧号 mod 5
+全部集中在一个相位，两段相位不同的镜头拼接时各自集中；1 条动作很少、只有 4 帧重复，不报）；同批人工剪的 9 条
+（7 条原生 24fps 录屏片、1 条 60fps、1 条 30fps 尾帧）全部 PASS，抽查的 2 条 24fps 录屏若按 30fps 重采样解码会误报；
+去抖后剪出的 12 条交付片里剧情段 0 帧被标，WARN 全部落在拼进去的 UI 录屏段。
 
 地区优先从素材 ID 文件名或 `<地区>/` 目录识别，其次 `--locale`。产物：`report.json`、`report.html`（每条附开头 3 秒 /
 中段 / 结尾 3 秒抽帧，FAIL 排最前）、`sheets/`。任一 FAIL 退出码 1。转写用 whisper-cli 自动识别语种，画面文字用

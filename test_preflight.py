@@ -91,6 +91,48 @@ class JudgeMediaTests(unittest.TestCase):
         self.assertFalse([r for r in results if r["check"] in {"silence", "loudness"}])
 
 
+def changes(frames: int, repeated=lambda f: False, cuts=(), motion=3.0) -> list[float]:
+    """frame_changes 的形状：第 f 帧在 repeated(f) 时原样重复上一帧，cuts 里的帧是新镜头的第一帧。"""
+    return [80.0 if f in cuts else 0.0 if repeated(f) else motion for f in range(1, frames)]
+
+
+class JudderTests(unittest.TestCase):
+    def test_24fps_duplicated_to_30fps_warns_with_count_and_phase(self) -> None:
+        verdict = preflight.judge_judder(changes(300, lambda f: f % 5 == 2), 30.0)
+        self.assertEqual(statuses(verdict, "judder"), ["WARN"])
+        self.assertIn("（60 帧）", verdict[0]["detail"])  # 第 2、7…297 帧
+        self.assertIn("mod 5 = 2", verdict[0]["detail"])
+
+    def test_shots_joined_with_different_cadence_each_count(self) -> None:
+        joined = changes(300, lambda f: f % 5 == (2 if f < 150 else 0), cuts={150})
+        verdict = preflight.judge_judder(joined, 30.0)
+        self.assertEqual(statuses(verdict, "judder"), ["WARN"])
+        self.assertIn("mod 5 = 2", verdict[0]["detail"])
+        self.assertIn("mod 5 = 0", verdict[0]["detail"])
+
+    def test_short_shots_on_the_same_cadence_add_up(self) -> None:
+        # 剪得碎：每个镜头只有 4 帧重复，单看哪个都不够 8 帧
+        cut_up = changes(100, lambda f: f % 5 == 2, cuts={20, 40, 60, 80})
+        self.assertEqual(statuses(preflight.judge_judder(cut_up, 30.0), "judder"), ["WARN"])
+
+    def test_native_motion_and_static_footage_pass(self) -> None:
+        self.assertEqual(preflight.judge_judder(changes(300), 30.0)[0]["detail"], "动作中没有重复帧")
+        self.assertEqual(statuses(preflight.judge_judder([0.0] * 300, 30.0), "judder"), ["PASS"])
+        slow = changes(300, lambda f: f % 5 == 2, motion=0.1)  # 动作太小看不出顿
+        self.assertEqual(statuses(preflight.judge_judder(slow, 30.0), "judder"), ["PASS"])
+
+    def test_repeats_off_the_5_frame_cadence_pass(self) -> None:
+        pal = preflight.judge_judder(changes(300, lambda f: f % 6 == 0), 30.0)  # 25→30fps 每 6 帧重复 1 帧
+        self.assertEqual(statuses(pal, "judder"), ["PASS"])
+        self.assertIn("没有形成", pal[0]["detail"])
+        # 每个镜头只偶尔停一帧：单帧谈不上节奏，即使凑够 8 个镜头也不报
+        held = changes(300, lambda f: f % 30 == 12, cuts=set(range(0, 300, 30)))
+        self.assertEqual(statuses(preflight.judge_judder(held, 30.0), "judder"), ["PASS"])
+
+    def test_undecodable_video_warns_instead_of_passing(self) -> None:
+        self.assertEqual(statuses(preflight.judge_judder(None, 30.0), "judder"), ["WARN"])
+
+
 class SpecAndDurationTests(unittest.TestCase):
     def probe(self, **video) -> dict:
         base = {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 1920, "height": 1080,
@@ -213,6 +255,7 @@ class MetadataTests(unittest.TestCase):
         self.assertTrue(all(0 <= t <= 2.95 for t in preflight.sheet_times(3.0)))
 
 
+DEJUDDER = "decimate=cycle=5,minterpolate=fps=30:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"  # README 写的修法
 TOOLS = all(Path(p or "").is_file() for p in (config.FFMPEG, config.FFPROBE, config.WHISPER_CLI, config.WHISPER_MODEL))
 OCR_READY = bool(config.SWIFTC) or Path(config.TESSERACT or "").is_file()
 
@@ -238,6 +281,9 @@ class EndToEndTests(unittest.TestCase):
              ["-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]", "-map", "[v]", "-map", "2:a"])
         make("silent.mp4", bars, ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"])
         make("cd_audio.mp4", bars, tone, rate="44100")
+        # 同一种横移画面：24fps 生成后由输出 -r 30 复制帧补成 30fps，对照原生 30fps
+        make("pulldown.mp4", ["-f", "lavfi", "-i", "testsrc2=s=540x960:r=24:d=12,scroll=h=0.005"], tone)
+        make("native_motion.mp4", ["-f", "lavfi", "-i", "testsrc2=s=540x960:r=30:d=12,scroll=h=0.004"], tone)
         cls.report = preflight.run_preflight([cls.tmp], "hakko-pc", "US", "google", cls.tmp / "report")
         cls.by_name = {e["name"]: e for e in cls.report["videos"]}
 
@@ -248,18 +294,46 @@ class EndToEndTests(unittest.TestCase):
     def failing_checks(self, name: str) -> set[str]:
         return {r["check"] for r in self.by_name[name]["results"] if r["status"] == "FAIL"}
 
+    def judder(self, name: str) -> dict:
+        return next(r for r in self.by_name[name]["results"] if r["check"] == "judder")
+
     def test_each_planted_defect_is_the_failure(self) -> None:
         self.assertEqual(self.failing_checks("good.mp4"), set())
         self.assertEqual(self.failing_checks("black_open.mp4"), {"black"})
         self.assertEqual(self.failing_checks("silent.mp4"), {"silence"})
         self.assertEqual(self.failing_checks("cd_audio.mp4"), set())  # 44.1kHz still plays on every platform
+        self.assertEqual(self.failing_checks("pulldown.mp4"), set())  # judder only ever warns
         self.assertEqual(self.report["counts"]["FAIL"], 2)
+
+    def test_pulldown_judder_warns_and_native_motion_passes(self) -> None:
+        verdict = self.judder("pulldown.mp4")
+        self.assertEqual(verdict["status"], "WARN")
+        self.assertIn("mod 5", verdict["detail"])
+        for name in ("native_motion.mp4", "good.mp4", "black_open.mp4", "silent.mp4", "cd_audio.mp4"):
+            self.assertEqual(self.judder(name)["status"], "PASS", name)
+
+    def test_documented_dejudder_fix_clears_the_warning(self) -> None:
+        fixed = self.tmp / "dejudder" / "pulldown.mp4"
+        fixed.parent.mkdir()
+        subprocess.run([config.FFMPEG, "-v", "error", "-y", "-t", "4", "-i", str(self.tmp / "pulldown.mp4"),
+                        "-vf", DEJUDDER, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", str(fixed)], check=True)
+        before = preflight.frame_changes(self.tmp / "pulldown.mp4")[:4 * 30 - 1]  # the same first 4 seconds
+        self.assertEqual(preflight.judge_judder(before, 30.0)[0]["status"], "WARN")
+        self.assertEqual(preflight.judge_judder(preflight.frame_changes(fixed), 30.0)[0]["detail"], "动作中没有重复帧")
+
+    def test_native_24fps_is_read_frame_by_frame_not_resampled(self) -> None:
+        native = self.tmp / "native24" / "pan.mp4"
+        native.parent.mkdir()
+        subprocess.run([config.FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i",
+                        "testsrc2=s=540x960:r=24:d=4,scroll=h=0.005", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                        str(native)], check=True)
+        self.assertEqual(preflight.judge_judder(preflight.frame_changes(native), 24.0)[0]["detail"], "动作中没有重复帧")
 
     def test_report_files_and_review_sheets_exist(self) -> None:
         out = self.tmp / "report"
         self.assertTrue((out / "report.html").is_file())
         data = json.loads((out / "report.json").read_text())
-        self.assertEqual(len(data["videos"]), 4)
+        self.assertEqual(len(data["videos"]), 6)
         for entry in data["videos"]:
             self.assertTrue((out / entry["sheet"]).stat().st_size > 10_000, entry["name"])
         self.assertFalse(list(out.glob(".preflight-*")))

@@ -111,7 +111,11 @@ BRANDS = [
     "Tipsy Chat",    # 不收单词 "Tipsy"：常用英文词，会误报我们自己的口播
     "TipsyChat",
     "Linky AI",
-    "Crushie",
+    "Crushie",       # 不收 "Whif"：按子串匹配会命中常用词 "whiff"
+    "Floze",
+    "Komiko",
+    "FoxyChat",
+    "Foxy Chat",     # FoxyChat 的分词变体
 ]
 
 # ---------------------------------------------------------------------------
